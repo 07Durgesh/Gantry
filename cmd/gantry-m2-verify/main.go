@@ -46,7 +46,7 @@ func main() {
 	fmt.Print("\n[2/7] Starting Background Worker Pool (The Baristas)... ")
 	portMgr := engine.NewPortManager(40000, 45000)
 	store := models.NewDeploymentStore()
-	worker := queue.NewWorker(docker, redisQ, portMgr, store)
+	worker := queue.NewWorker(docker, redisQ, portMgr, store, nil)
 
 	go worker.Start(ctx)
 	fmt.Println("WORKER POOL READY ✅")

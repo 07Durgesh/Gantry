@@ -10,6 +10,7 @@ import (
 
 	"github.com/gantry-project/gantry/internal/builder"
 	"github.com/gantry-project/gantry/internal/engine"
+	"github.com/gantry-project/gantry/internal/ingress"
 	"github.com/gantry-project/gantry/internal/models"
 )
 
@@ -18,14 +19,16 @@ type Worker struct {
 	queue   *RedisQueue
 	portMgr *engine.PortManager
 	store   *models.DeploymentStore
+	caddy   *ingress.CaddyClient
 }
 
-func NewWorker(docker *engine.DockerEngine, queue *RedisQueue, portMgr *engine.PortManager, store *models.DeploymentStore) *Worker {
+func NewWorker(docker *engine.DockerEngine, queue *RedisQueue, portMgr *engine.PortManager, store *models.DeploymentStore, caddy *ingress.CaddyClient) *Worker {
 	return &Worker{
 		docker:  docker,
 		queue:   queue,
 		portMgr: portMgr,
 		store:   store,
+		caddy:   caddy,
 	}
 }
 
@@ -103,12 +106,20 @@ func (w *Worker) processJob(ctx context.Context, job *BuildJob) {
 		return
 	}
 
-	// Step 4: Run container
+	// Step 4: Run container with cgroups resource constraints (256MB RAM, 0.5 vCPU)
 	w.store.UpdateStatus(depID, models.StatusStarting, "")
-	containerName := fmt.Sprintf("gantry-%s-%s", job.AppName, depID[4:12])
-	_ = w.queue.PublishLog(ctx, depID, fmt.Sprintf("[Gantry] 🚢 Starting container on host port %d...\n", hostPort))
+	suffix := depID
+	if len(depID) > 8 {
+		suffix = depID[len(depID)-8:]
+	}
+	containerName := fmt.Sprintf("gantry-%s-%s", job.AppName, suffix)
+	_ = w.queue.PublishLog(ctx, depID, fmt.Sprintf("[Gantry] 🚢 Starting container (Limits: 256MB RAM, 0.5 vCPU) on host port %d...\n", hostPort))
 
-	containerID, err := w.docker.RunContainer(ctx, dep.ImageTag, containerName, hostPort, dep.ContainerPort)
+	limits := &models.ContainerLimits{
+		MemoryBytes: 256 * 1024 * 1024, // 256MB
+		NanoCPUs:    500_000_000,       // 0.5 CPU
+	}
+	containerID, err := w.docker.RunContainerWithLimits(ctx, dep.ImageTag, containerName, hostPort, dep.ContainerPort, limits)
 	if err != nil {
 		w.portMgr.Release(hostPort)
 		w.failJob(ctx, job, fmt.Sprintf("Container run failed: %v", err))
@@ -124,15 +135,41 @@ func (w *Worker) processJob(ctx context.Context, job *BuildJob) {
 	probeURL := fmt.Sprintf("http://127.0.0.1:%d/healthz", hostPort)
 	resp, err := http.Get(probeURL)
 	if err != nil || resp.StatusCode != http.StatusOK {
-		w.failJob(ctx, job, fmt.Sprintf("Container failed healthcheck at %s", probeURL))
+		// Inspect if container was killed by OOM
+		oom, _ := w.docker.CheckContainerOOM(ctx, containerID)
+		errMsg := fmt.Sprintf("Container failed healthcheck at %s", probeURL)
+		if oom {
+			errMsg = "Container exceeded memory cap of 256MB and was terminated by the OOM-killer (Exit Code 137)"
+		}
+		w.failJob(ctx, job, errMsg)
 		return
 	}
 	_ = resp.Body.Close()
 
-	// Step 6: Mark healthy and acknowledge job
+	// Step 6: Dynamic Ingress Registration in Caddy (Zero-Downtime Switchover!)
+	if w.caddy != nil {
+		_ = w.queue.PublishLog(ctx, depID, fmt.Sprintf("[Gantry] 🔀 Registering ingress route: %s.localhost -> port %d\n", job.AppName, hostPort))
+		if err := w.caddy.RegisterRoute(ctx, job.AppName, hostPort); err != nil {
+			_ = w.queue.PublishLog(ctx, depID, fmt.Sprintf("[Gantry] ⚠️ Ingress route registration warning: %v\n", err))
+		}
+	}
+
+	// Step 7: Blue-Green Decommissioning of Old Version (Zero Downtime)
+	oldDep, hasOld := w.store.GetActiveApp(job.AppName)
+	if hasOld && oldDep.ID != depID {
+		_ = w.queue.PublishLog(ctx, depID, fmt.Sprintf("[Gantry] 🔄 Blue-Green Switchover complete! Decommissioning old container %s (port %d)...\n", oldDep.ID, oldDep.HostPort))
+		_ = w.docker.StopAndRemoveContainer(ctx, oldDep.ContainerID)
+		w.portMgr.Release(oldDep.HostPort)
+		w.store.UpdateStatus(oldDep.ID, models.StatusStopped, "Superseded by newer deployment")
+	}
+
+	// Mark new deployment as the currently active version for this app
+	w.store.SetActiveApp(job.AppName, depID)
+
+	// Step 8: Final success state & acknowledge queue job
 	w.store.UpdateStatus(depID, models.StatusHealthy, "")
-	_ = w.queue.PublishLog(ctx, depID, fmt.Sprintf("[Gantry] ✅ Application is healthy and live on port %d!\n", hostPort))
-	_ = w.queue.PublishLog(ctx, depID, "[EOF]\n") // Signal stream termination to clients
+	_ = w.queue.PublishLog(ctx, depID, fmt.Sprintf("[Gantry] ✅ Application is healthy and live at http://%s.localhost!\n", job.AppName))
+	_ = w.queue.PublishLog(ctx, depID, "[EOF]\n")
 	_ = w.queue.Acknowledge(ctx, job)
 }
 

@@ -11,6 +11,7 @@ import (
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
+	"github.com/gantry-project/gantry/internal/models"
 )
 
 // DockerEngine wraps the official Docker client SDK to manage images and containers.
@@ -60,9 +61,18 @@ func (de *DockerEngine) BuildImage(ctx context.Context, tarStream io.Reader, tag
 	return resp.Body, nil
 }
 
-// RunContainer creates and starts a container with port binding and basic resource limits.
-// E.g., hostPort=40001 -> containerPort=8080.
+// RunContainer creates and starts a container with port binding and default resource limits.
 func (de *DockerEngine) RunContainer(ctx context.Context, imageName string, containerName string, hostPort int, containerPort int) (string, error) {
+	// Default limits: 256MB RAM, 0.5 vCPU
+	defaultLimits := &models.ContainerLimits{
+		MemoryBytes: 256 * 1024 * 1024,
+		NanoCPUs:    500_000_000,
+	}
+	return de.RunContainerWithLimits(ctx, imageName, containerName, hostPort, containerPort, defaultLimits)
+}
+
+// RunContainerWithLimits creates and starts a container enforcing hard cgroup memory and CPU constraints.
+func (de *DockerEngine) RunContainerWithLimits(ctx context.Context, imageName string, containerName string, hostPort int, containerPort int, limits *models.ContainerLimits) (string, error) {
 	targetPort := nat.Port(fmt.Sprintf("%d/tcp", containerPort))
 
 	config := &container.Config{
@@ -75,6 +85,14 @@ func (de *DockerEngine) RunContainer(ctx context.Context, imageName string, cont
 		},
 	}
 
+	var res container.Resources
+	if limits != nil {
+		res = container.Resources{
+			Memory:   limits.MemoryBytes,
+			NanoCPUs: limits.NanoCPUs,
+		}
+	}
+
 	hostConfig := &container.HostConfig{
 		PortBindings: nat.PortMap{
 			targetPort: []nat.PortBinding{
@@ -84,6 +102,7 @@ func (de *DockerEngine) RunContainer(ctx context.Context, imageName string, cont
 				},
 			},
 		},
+		Resources: res,
 		RestartPolicy: container.RestartPolicy{
 			Name: "no",
 		},
@@ -101,6 +120,20 @@ func (de *DockerEngine) RunContainer(ctx context.Context, imageName string, cont
 	}
 
 	return createResp.ID, nil
+}
+
+// CheckContainerOOM inspects if a container crashed due to Linux cgroup memory exhaustion (Exit Code 137).
+func (de *DockerEngine) CheckContainerOOM(ctx context.Context, containerID string) (bool, error) {
+	inspect, err := de.cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return false, err
+	}
+	if inspect.State != nil {
+		if inspect.State.OOMKilled || inspect.State.ExitCode == 137 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // StopAndRemoveContainer gracefully stops a running container and deletes it.
