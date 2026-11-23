@@ -31,3 +31,8 @@ dist/
 docs/JOURNAL.md
 *.journal.md
 journal/
+
+# Internal Specs & Blueprints (contains personal career context)
+CLOUD_INFRA_PROJECT_BLUEPRINT.md
+*BLUEPRINT*
+*blueprint*
