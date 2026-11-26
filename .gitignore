@@ -27,6 +27,10 @@ Thumbs.db
 tmp/
 dist/
 
+# Go build cache (sandbox workaround)
+.gocache/
+.gopath/
+
 # Personal Engineering Notes & Private Journals
 docs/JOURNAL.md
 *.journal.md

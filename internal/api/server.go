@@ -10,9 +10,16 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
 	"github.com/gantry-project/gantry/internal/models"
 	"github.com/gantry-project/gantry/internal/queue"
 )
+
+// BuildQueue abstracts the build job queue and log pub/sub for the HTTP API.
+type BuildQueue interface {
+	Enqueue(ctx context.Context, job queue.BuildJob) error
+	SubscribeLogs(ctx context.Context, deploymentID string) *redis.PubSub
+}
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
@@ -21,12 +28,12 @@ var upgrader = websocket.Upgrader{
 }
 
 type Server struct {
-	queue *queue.RedisQueue
+	queue BuildQueue
 	store *models.DeploymentStore
 	mux   *http.ServeMux
 }
 
-func NewServer(q *queue.RedisQueue, store *models.DeploymentStore) *Server {
+func NewServer(q BuildQueue, store *models.DeploymentStore) *Server {
 	s := &Server{
 		queue: q,
 		store: store,
@@ -37,7 +44,9 @@ func NewServer(q *queue.RedisQueue, store *models.DeploymentStore) *Server {
 }
 
 func (s *Server) registerRoutes() {
+	s.mux.HandleFunc("/api/health", s.handleHealth)
 	s.mux.HandleFunc("/api/deploy", s.handleDeploy)
+	s.mux.HandleFunc("/api/deployments", s.handleListDeployments)
 	s.mux.HandleFunc("/api/deployments/", s.handleGetDeployment)
 	s.mux.HandleFunc("/api/logs/", s.handleLogStreamWS)
 }
@@ -104,6 +113,26 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		Status:       dep.Status,
 		Message:      "Build job accepted and queued for worker processing",
 	})
+}
+
+// handleHealth reports daemon readiness.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleListDeployments returns all deployments ordered from newest to oldest.
+func (s *Server) handleListDeployments(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.store.List())
 }
 
 // handleGetDeployment queries current status of a deployment.

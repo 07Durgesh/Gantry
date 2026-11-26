@@ -2,6 +2,7 @@ package models
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -86,4 +87,21 @@ func (s *DeploymentStore) SetContainerDetails(id string, containerID string, hos
 		dep.HostPort = hostPort
 		dep.UpdatedAt = time.Now()
 	}
+}
+
+// List returns all tracked deployments ordered from newest to oldest.
+func (s *DeploymentStore) List() []*Deployment {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	list := make([]*Deployment, 0, len(s.deployments))
+	for _, dep := range s.deployments {
+		copyDep := *dep
+		list = append(list, &copyDep)
+	}
+
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].CreatedAt.After(list[j].CreatedAt)
+	})
+	return list
 }
